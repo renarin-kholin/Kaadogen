@@ -47,7 +47,7 @@ export const ProjectManagerModal: React.FC<ProjectManagerModalProps> = ({
 
 				<div className="mt-auto space-y-3">
 					<a
-						href="https://github.com/acm-ioit/kaadogen"
+						href="https://github.com/renarin-kholin/Kaadogen"
 						target="_blank"
 						rel="noreferrer"
 						className="flex items-center gap-2 text-gray-500 hover:text-white transition-colors text-xs group"
