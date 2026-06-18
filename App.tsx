@@ -17,15 +17,21 @@ import { SvgNodeInfo, SmartObject, JsonDataRow, FontData } from "./types";
 import { FontManagerModal } from "./components/FontManagerModal";
 import { ExportModal, ExportOptions } from "./components/ExportModal";
 import { ProjectManagerModal } from "./components/ProjectManagerModal";
+import { Toaster } from "./components/Toaster";
 import { jsPDF } from "jspdf";
 import JSZip from "jszip";
 import * as htmlToImage from "html-to-image";
-import JsBarcode from "jsbarcode";
 
 // Hooks & Utils
 import { useProjectSystem } from "./hooks/useProjectSystem";
 import { useViewport } from "./hooks/useViewport";
-import { parseSvgString, generateCustomQrSvg } from "./utils/helpers";
+import {
+	parseSvgString,
+	validateJsonData,
+	renderRecordSvg,
+	getSvgDimensions,
+} from "./utils/helpers";
+import { toast } from "./utils/toast";
 
 // --- Selection Overlay Component ---
 const SelectionOverlay = ({
@@ -125,6 +131,8 @@ export default function App() {
 
 	// UI State
 	const [isPreviewMode, setIsPreviewMode] = useState<boolean>(false);
+	const [isDirty, setIsDirty] = useState(false);
+	const [isDragging, setIsDragging] = useState(false);
 	const [showProjectManager, setShowProjectManager] = useState(true);
 	const [isEditingName, setIsEditingName] = useState(false);
 	const [leftSidebarWidth, setLeftSidebarWidth] = useState(240);
@@ -146,6 +154,9 @@ export default function App() {
 	const canvasRef = useRef<HTMLDivElement>(null);
 	const contentRef = useRef<HTMLDivElement>(null);
 	const nameInputRef = useRef<HTMLInputElement>(null);
+	const latestSave = useRef<() => void>(() => {});
+	const dirtyRef = useRef(false);
+	dirtyRef.current = isDirty && !!svgContent;
 
 	// Derived
 	const availableKeys = useMemo(
@@ -199,7 +210,11 @@ export default function App() {
 	// --- Action Handlers ---
 
 	const handleSave = async () => {
-		await project.saveProject(
+		if (!svgContent) {
+			toast("Nothing to save yet — import an SVG template first.", "info");
+			return;
+		}
+		const id = await project.saveProject(
 			svgContent,
 			smartObjects,
 			jsonData,
@@ -210,19 +225,26 @@ export default function App() {
 			contentRef.current,
 			selectedId
 		);
+		if (id) {
+			setIsDirty(false);
+			toast("Project saved.", "success");
+		}
 	};
+	latestSave.current = handleSave;
 
-	const handleLoadProject = (id: string) => {
-		const data = project.loadProject(id);
+	const handleLoadProject = async (id: string) => {
+		const data = await project.loadProject(id);
 		if (data) {
 			setSvgContent(data.svgContent);
 			setSmartObjects(data.smartObjects);
 			setJsonData(data.jsonData);
+			setCurrentJsonIndex(0);
 			setNodes(data.nodes);
 			setNodeMap(data.nodeMap);
 			viewport.setPan(data.pan);
 			viewport.setScale(data.scale);
 			setSelectedId(null);
+			setIsDirty(false);
 			setShowProjectManager(false);
 		}
 	};
@@ -234,32 +256,55 @@ export default function App() {
 		setNodeMap({});
 		setSmartObjects({});
 		setJsonData([]);
+		setCurrentJsonIndex(0);
+		setSelectedId(null);
+		setIsDirty(false);
 		viewport.setPan({ x: 100, y: 100 });
 		viewport.setScale(1);
 		setShowProjectManager(false);
 	};
 
+	const processSvgText = (text: string) => {
+		let parsed;
+		try {
+			parsed = parseSvgString(text);
+		} catch (err) {
+			console.error("SVG parse failed", err);
+			toast("Could not read that SVG file.", "error");
+			return;
+		}
+		if (parsed.rootNodes.length === 0) {
+			toast("No usable elements found in that SVG.", "error");
+			return;
+		}
+		if (parsed.hasMissingFonts) {
+			setDetectedFonts(parsed.detectedFonts);
+			setPendingSvgData({
+				content: text,
+				nodes: parsed.rootNodes,
+				map: parsed.map,
+			});
+			setShowFontModal(true);
+		} else {
+			finalizeSvgLoad(text, parsed.rootNodes, parsed.map);
+		}
+	};
+
+	const loadSvgFile = (file: File) => {
+		if (!/\.svg$/i.test(file.name) && file.type !== "image/svg+xml") {
+			toast("Please provide an .svg file.", "error");
+			return;
+		}
+		const reader = new FileReader();
+		reader.onload = (event) => processSvgText(event.target?.result as string);
+		reader.onerror = () => toast("Failed to read the file.", "error");
+		reader.readAsText(file);
+	};
+
 	const handleSvgUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
 		const file = e.target.files?.[0];
-		if (!file) return;
-		const reader = new FileReader();
-		reader.onload = (event) => {
-			const text = event.target?.result as string;
-			const parsed = parseSvgString(text);
-
-			if (parsed.hasMissingFonts) {
-				setDetectedFonts(parsed.detectedFonts);
-				setPendingSvgData({
-					content: text,
-					nodes: parsed.rootNodes,
-					map: parsed.map,
-				});
-				setShowFontModal(true);
-			} else {
-				finalizeSvgLoad(text, parsed.rootNodes, parsed.map);
-			}
-		};
-		reader.readAsText(file);
+		if (file) loadSvgFile(file);
+		e.target.value = "";
 	};
 
 	const finalizeSvgLoad = (
@@ -272,6 +317,7 @@ export default function App() {
 		setNodeMap(map);
 		setSmartObjects({});
 		setSelectedId(null);
+		setIsDirty(true);
 		viewport.setPan({ x: 100, y: 100 });
 		viewport.setScale(1);
 		setShowFontModal(false);
@@ -295,17 +341,27 @@ export default function App() {
 		if (!file) return;
 		const reader = new FileReader();
 		reader.onload = (event) => {
+			let parsed: unknown;
 			try {
-				const json = JSON.parse(event.target?.result as string);
-				if (Array.isArray(json)) {
-					setJsonData(json);
-					setCurrentJsonIndex(0);
-				} else alert("JSON must be an array of objects.");
+				parsed = JSON.parse(event.target?.result as string);
 			} catch (err) {
-				alert("Invalid JSON file.");
+				toast("Invalid JSON — the file could not be parsed.", "error");
+				return;
 			}
+			const result = validateJsonData(parsed);
+			if (!result.data) {
+				toast(result.error || "Invalid JSON data.", "error");
+				return;
+			}
+			setJsonData(result.data);
+			setCurrentJsonIndex(0);
+			setIsDirty(true);
+			result.warnings.forEach((w) => toast(w, "warning"));
+			toast(`Loaded ${result.data.length} record(s).`, "success");
 		};
+		reader.onerror = () => toast("Failed to read the file.", "error");
 		reader.readAsText(file);
+		e.target.value = "";
 	};
 
 	const handleCanvasClick = (e: React.MouseEvent) => {
@@ -348,98 +404,22 @@ export default function App() {
 	// --- Render Logic (Smart Objects) ---
 	const [finalRenderedSvg, setFinalRenderedSvg] = useState<string | null>(null);
 	useEffect(() => {
-		const generateAsync = async () => {
-			if (!svgContent) {
-				setFinalRenderedSvg(null);
-				return;
-			}
-			if ((!isPreviewMode && !isExporting) || jsonData.length === 0) {
-				setFinalRenderedSvg(svgContent);
-				return;
-			}
-
-			const parser = new DOMParser();
-			const doc = parser.parseFromString(svgContent, "image/svg+xml");
-			const currentRow = jsonData[currentJsonIndex];
-			if (!currentRow) return;
-
-			for (const obj of Object.values(smartObjects)) {
-				const smartObj = obj as SmartObject;
-				const el = doc.getElementById(smartObj.id);
-				if (el && currentRow[smartObj.key]) {
-					const val = currentRow[smartObj.key];
-					if (smartObj.type === "text") {
-						if (smartObj.originalValue)
-							el.innerHTML = el.innerHTML
-								.split(smartObj.originalValue)
-								.join(val);
-					} else if (smartObj.type === "image") {
-						el.setAttribute("href", val);
-						el.setAttributeNS("http://www.w3.org/1999/xlink", "href", val);
-					} else if (smartObj.type === "qrcode" && smartObj.qrConfig) {
-						const qrSvgStr = generateCustomQrSvg(val, smartObj.qrConfig);
-						const container = doc.createElementNS(
-							"http://www.w3.org/2000/svg",
-							"svg"
-						);
-						// Copy geometry attributes
-						["x", "y", "width", "height"].forEach((attr) =>
-							container.setAttribute(attr, el.getAttribute(attr) || "0")
-						);
-						container.setAttribute(
-							"viewBox",
-							"0 0 " +
-								(smartObj.qrConfig.errorCorrectionLevel === "H" ? 100 : 100) +
-								" " +
-								100
-						); // Approx
-						// Actually parse the generated QR to get exact viewbox if needed, but pure string replacement works better if we insert innerHTML
-						const qrDoc = new DOMParser().parseFromString(
-							qrSvgStr,
-							"image/svg+xml"
-						);
-						container.setAttribute(
-							"viewBox",
-							qrDoc.documentElement.getAttribute("viewBox") || "0 0 100 100"
-						);
-						container.innerHTML = qrDoc.documentElement.innerHTML;
-						container.id = smartObj.id;
-						el.replaceWith(container);
-					} else if (smartObj.type === "barcode" && smartObj.barcodeConfig) {
-						try {
-							const tempSvg = document.createElementNS(
-								"http://www.w3.org/2000/svg",
-								"svg"
-							);
-							JsBarcode(tempSvg, val, {
-								format: smartObj.barcodeConfig.format,
-								lineColor: smartObj.barcodeConfig.lineColor,
-								displayValue: smartObj.barcodeConfig.displayValue,
-								margin: 0,
-								background: "transparent",
-							});
-							const container = doc.createElementNS(
-								"http://www.w3.org/2000/svg",
-								"svg"
-							);
-							["x", "y", "width", "height"].forEach((attr) =>
-								container.setAttribute(attr, el.getAttribute(attr) || "0")
-							);
-							container.setAttribute(
-								"viewBox",
-								tempSvg.getAttribute("viewBox") || "0 0 100 100"
-							);
-							container.setAttribute("preserveAspectRatio", "none");
-							container.innerHTML = tempSvg.innerHTML;
-							container.id = smartObj.id;
-							el.replaceWith(container);
-						} catch (e) {}
-					}
-				}
-			}
-			setFinalRenderedSvg(doc.documentElement.outerHTML);
-		};
-		generateAsync();
+		if (!svgContent) {
+			setFinalRenderedSvg(null);
+			return;
+		}
+		if ((!isPreviewMode && !isExporting) || jsonData.length === 0) {
+			setFinalRenderedSvg(svgContent);
+			return;
+		}
+		const currentRow = jsonData[currentJsonIndex];
+		if (!currentRow) return;
+		try {
+			setFinalRenderedSvg(renderRecordSvg(svgContent, smartObjects, currentRow));
+		} catch (e) {
+			console.error("Render failed", e);
+			setFinalRenderedSvg(svgContent);
+		}
 	}, [
 		svgContent,
 		isPreviewMode,
@@ -449,85 +429,98 @@ export default function App() {
 		isExporting,
 	]);
 
+	// --- Keyboard shortcuts & unsaved-changes guard ---
+	useEffect(() => {
+		const onKeyDown = (e: KeyboardEvent) => {
+			if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+				e.preventDefault();
+				latestSave.current();
+			} else if (e.key === "Escape") {
+				setSelectedId(null);
+			}
+		};
+		const onBeforeUnload = (e: BeforeUnloadEvent) => {
+			if (dirtyRef.current) {
+				e.preventDefault();
+				e.returnValue = "";
+			}
+		};
+		window.addEventListener("keydown", onKeyDown);
+		window.addEventListener("beforeunload", onBeforeUnload);
+		return () => {
+			window.removeEventListener("keydown", onKeyDown);
+			window.removeEventListener("beforeunload", onBeforeUnload);
+		};
+	}, []);
+
+	// --- Drag & drop SVG onto the canvas ---
+	const handleDragOver = (e: React.DragEvent) => {
+		if (e.dataTransfer.types.includes("Files")) {
+			e.preventDefault();
+			setIsDragging(true);
+		}
+	};
+	const handleDragLeave = (e: React.DragEvent) => {
+		if (e.currentTarget === e.target) setIsDragging(false);
+	};
+	const handleDrop = (e: React.DragEvent) => {
+		e.preventDefault();
+		setIsDragging(false);
+		const file = e.dataTransfer.files?.[0];
+		if (file) loadSvgFile(file);
+	};
+
 	// --- Export Logic ---
+	// Renders each record to a string and rasterises it from a dedicated
+	// off-screen node, so export no longer depends on React re-render timing
+	// (the old approach drove the visible canvas and slept a fixed 200ms/record,
+	// which raced and could capture blank or stale cards).
 	const handleExport = async (options: ExportOptions) => {
-		if (jsonData.length === 0) return;
+		if (jsonData.length === 0 || !svgContent) return;
 		setIsExporting(true);
 		setExportProgress(0);
-		setIsPreviewMode(true);
-		await new Promise((resolve) => setTimeout(resolve, 100));
 
-		const svgEl = contentRef.current?.querySelector("svg");
-		if (!svgEl) {
-			setIsExporting(false);
-			return;
-		}
-
-		let width = parseFloat(svgEl.getAttribute("width") || "0");
-		let height = parseFloat(svgEl.getAttribute("height") || "0");
-		if (!width || !height) {
-			const viewBox = svgEl
-				.getAttribute("viewBox")
-				?.split(/[\s,]+/)
-				.map(Number);
-			if (viewBox && viewBox.length === 4) {
-				width = viewBox[2];
-				height = viewBox[3];
-			} else {
-				const rect = svgEl.getBoundingClientRect();
-				width = rect.width / viewport.scale;
-				height = rect.height / viewport.scale;
-			}
-		}
-		if (!width) width = 800;
-		if (!height) height = 600;
-
+		const { width, height } = getSvgDimensions(svgContent);
 		const pdfWidth = width * 0.75;
 		const pdfHeight = height * 0.75;
+		const bleed = 0.5;
 		const zip = new JSZip();
 		const pdf =
 			options.format === "pdf"
 				? new jsPDF({ unit: "pt", format: [pdfWidth, pdfHeight] })
 				: null;
-		const bleed = 0.5;
+
+		// Off-screen stage used only for rasterisation.
+		const stage = document.createElement("div");
+		stage.style.cssText =
+			"position:fixed;left:-100000px;top:0;pointer-events:none;opacity:0;";
+		document.body.appendChild(stage);
 
 		try {
 			for (let i = 0; i < jsonData.length; i++) {
-				setCurrentJsonIndex(i);
-				await new Promise((resolve) => setTimeout(resolve, 200));
-
-				const currentNode = contentRef.current?.querySelector("svg");
+				const rendered = renderRecordSvg(svgContent, smartObjects, jsonData[i]);
 				const fileName = `${options.filename}-${i + 1}`;
 
 				if (options.format === "zip-svg") {
-					if (finalRenderedSvg) zip.file(`${fileName}.svg`, finalRenderedSvg);
+					zip.file(`${fileName}.svg`, rendered);
 				} else {
+					stage.innerHTML = rendered;
+					const node = stage.querySelector("svg") as unknown as HTMLElement;
+					if (!node) continue;
+
 					const pixelRatio = options.dpi / 96;
-					// Fallback logic inline or utility? keeping inline for context simplicity in this refactor step
-					let dataUrl;
+					const opts = {
+						pixelRatio,
+						width,
+						height,
+						cacheBust: true,
+						style: { transform: "none", margin: "0" },
+					};
+					let dataUrl: string;
 					try {
-						dataUrl = await htmlToImage.toPng(
-							currentNode as unknown as HTMLElement,
-							{
-								pixelRatio,
-								width,
-								height,
-								cacheBust: true,
-								style: { transform: "none", margin: "0" },
-							}
-						);
+						dataUrl = await htmlToImage.toPng(node, opts);
 					} catch {
-						dataUrl = await htmlToImage.toPng(
-							currentNode as unknown as HTMLElement,
-							{
-								pixelRatio,
-								width,
-								height,
-								cacheBust: true,
-								skipFonts: true,
-								style: { transform: "none", margin: "0" },
-							}
-						);
+						dataUrl = await htmlToImage.toPng(node, { ...opts, skipFonts: true });
 					}
 
 					if (options.format === "pdf" && pdf) {
@@ -541,9 +534,7 @@ export default function App() {
 							pdfHeight + bleed * 2
 						);
 					} else {
-						zip.file(`${fileName}.png`, dataUrl.split(",")[1], {
-							base64: true,
-						});
+						zip.file(`${fileName}.png`, dataUrl.split(",")[1], { base64: true });
 					}
 				}
 				setExportProgress(i + 1);
@@ -556,14 +547,16 @@ export default function App() {
 				link.href = URL.createObjectURL(content);
 				link.download = `${options.filename}.zip`;
 				link.click();
+				URL.revokeObjectURL(link.href);
 			}
+			toast(`Exported ${jsonData.length} card(s).`, "success");
 		} catch (error) {
 			console.error("Export failed", error);
-			alert("Export failed.");
+			toast("Export failed. See console for details.", "error");
 		} finally {
+			stage.remove();
 			setIsExporting(false);
 			setShowExportModal(false);
-			setCurrentJsonIndex(0);
 		}
 	};
 
@@ -601,10 +594,15 @@ export default function App() {
 			<ProjectManagerModal
 				isOpen={showProjectManager}
 				projects={project.recentProjects}
+				isLoading={project.isLoadingProjects}
 				onOpenProject={handleLoadProject}
 				onNewProject={handleCreateNew}
 				onDeleteProject={project.deleteProject}
+				onRenameProject={project.renameProject}
+				onDuplicateProject={project.duplicateProject}
 			/>
+
+			<Toaster />
 
 			<ExportModal
 				isOpen={showExportModal}
@@ -630,7 +628,10 @@ export default function App() {
 							<input
 								ref={nameInputRef}
 								value={project.projectName}
-								onChange={(e) => project.setProjectName(e.target.value)}
+								onChange={(e) => {
+									project.setProjectName(e.target.value);
+									setIsDirty(true);
+								}}
 								onBlur={() => setIsEditingName(false)}
 								onKeyDown={(e) => e.key === "Enter" && setIsEditingName(false)}
 								autoFocus
@@ -647,8 +648,26 @@ export default function App() {
 								<EditIcon className="w-3 h-3 text-gray-600 opacity-0 group-hover:opacity-100 transition-opacity" />
 							</div>
 						)}
-						<span className="text-[10px] text-gray-500 leading-none mt-0.5">
-							{project.currentProjectId ? "Saved locally" : "Unsaved"}
+						<span
+							className="text-[10px] leading-none mt-0.5"
+							style={{
+								color:
+									project.saveStatus === "error"
+										? "#F87171"
+										: isDirty
+										? "#FBBF24"
+										: "#6B7280",
+							}}
+						>
+							{project.saveStatus === "saving"
+								? "Saving…"
+								: project.saveStatus === "error"
+								? "Save failed"
+								: isDirty
+								? "Unsaved changes"
+								: project.currentProjectId
+								? "Saved locally"
+								: "Unsaved"}
 						</span>
 					</div>
 				</div>
@@ -753,7 +772,7 @@ export default function App() {
 						onClick={() =>
 							jsonData.length > 0
 								? setShowExportModal(true)
-								: alert("Upload JSON data first.")
+								: toast("Load JSON data before exporting.", "info")
 						}
 						disabled={isExporting}
 						className="bg-[#DFFF50] text-black text-[11px] font-medium px-3 py-1.5 rounded hover:bg-[#CBE649] flex items-center gap-1.5 disabled:opacity-50"
@@ -789,6 +808,9 @@ export default function App() {
 						onMouseUp={viewport.handleMouseUp}
 						onMouseLeave={viewport.handleMouseUp}
 						onClick={handleCanvasClick}
+						onDragOver={handleDragOver}
+						onDragLeave={handleDragLeave}
+						onDrop={handleDrop}
 					>
 						<div
 							className="absolute inset-0 pointer-events-none opacity-[0.03]"
@@ -801,6 +823,14 @@ export default function App() {
 								backgroundPosition: `${viewport.pan.x}px ${viewport.pan.y}px`,
 							}}
 						></div>
+
+						{isDragging && (
+							<div className="absolute inset-4 z-40 pointer-events-none border-2 border-dashed border-[#DFFF50] rounded-xl bg-[#DFFF50]/5 flex items-center justify-center">
+								<p className="text-sm font-medium text-[#DFFF50]">
+									Drop SVG template to import
+								</p>
+							</div>
+						)}
 
 						{svgContent ? (
 							<div
@@ -870,7 +900,8 @@ export default function App() {
 							? smartObjects[selectedId]
 							: undefined
 					}
-					onUpdateSmartObject={(id, updates) =>
+					onUpdateSmartObject={(id, updates) => {
+						setIsDirty(true);
 						setSmartObjects((prev) =>
 							updates
 								? {
@@ -878,8 +909,8 @@ export default function App() {
 										[id]: { ...(prev[id] || {}), ...updates } as SmartObject,
 								  }
 								: (delete prev[id], { ...prev })
-						)
-					}
+						);
+					}}
 					availableKeys={availableKeys}
 					width={rightSidebarWidth}
 					setWidth={setRightSidebarWidth}

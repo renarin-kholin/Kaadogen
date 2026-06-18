@@ -10,7 +10,7 @@ Kaadogen is a Figma-inspired ID card batch generation tool built with React, Typ
 
 Uses React hooks for state, no external store. Key custom hooks:
 
-- **`useProjectSystem`**: Handles project persistence in `localStorage` (keys: `kaadogen_index`, `kaadogen_project_{id}`). Manages save/load/delete with thumbnail generation via `html-to-image`.
+- **`useProjectSystem`**: Async project persistence backed by **IndexedDB** (`utils/db.ts`, stores `meta` + `data`). Manages save/load/delete/rename/duplicate, exposes `saveStatus`, and generates thumbnails via `html-to-image`. Legacy `localStorage` projects are migrated once on first boot.
 - **`useViewport`**: Controls canvas pan/zoom/tool state. Implements Figma-like spacebar hand tool, middle-click pan, and Ctrl+scroll zoom with focal point adjustment.
 
 ### Smart Object System
@@ -59,14 +59,19 @@ On SVG import, `parseSvgString()` extracts `font-family` declarations via regex,
 
 **Key Pattern**: Always wait for fonts before finalizing SVG load to avoid rendering issues.
 
-### Gemini AI Integration
+### Gemini AI Integration (planned — not yet implemented)
 
-`geminiService.ts` implements `autoMapFields()`:
+> **Status:** There is currently **no `services/` directory and no `geminiService.ts`**. The
+> `@google/genai` dependency and the `process.env.API_KEY` define in `vite.config.ts` are wired up,
+> but no AI field-mapping code exists yet. Treat the notes below as the intended design, not current
+> behaviour.
+
+Intended `autoMapFields()`:
 
 - Sends SVG text content + JSON keys to `gemini-2.5-flash`
 - Uses structured JSON output schema for mapping suggestions
 - API key from env: `process.env.API_KEY` (set via Vite `define` in `vite.config.ts`)
-- **Important**: Gemini is used for field mapping suggestions only, not for runtime data generation
+- **Important**: Gemini would be used for field mapping suggestions only, not for runtime data generation
 
 ### Viewport Interaction Model
 
@@ -81,11 +86,13 @@ Canvas implements custom pan/zoom without external libraries:
 
 ### File Organization
 
-- **`App.tsx`**: Monolithic main component (570 lines). Houses all state, SVG parsing, export logic, and canvas rendering.
-- **`components/`**: Modals and panels (no complex logic, mainly UI).
+- **`App.tsx`**: Main component. Houses app state, SVG load, preview, export orchestration, and canvas rendering.
+- **`components/`**: Modals and panels (UI). Includes `Toaster.tsx` (global toast renderer).
 - **`hooks/`**: Stateful logic extraction (`useProjectSystem`, `useViewport`).
-- **`utils/helpers.ts`**: Pure functions for SVG parsing, QR generation.
-- **`services/`**: External API integration (Gemini only).
+- **`utils/helpers.ts`**: Pure functions — SVG parsing, QR generation, JSON validation (`validateJsonData`), record rendering (`renderRecordSvg`).
+- **`utils/db.ts`**: IndexedDB persistence (projects) + one-time localStorage migration.
+- **`utils/toast.ts`**: Dependency-free toast bus used app-wide instead of `alert()`.
+- **`services/`**: Not present yet — reserved for future external API integration (see Gemini note above).
 
 ### TypeScript Patterns
 
@@ -105,9 +112,9 @@ Canvas implements custom pan/zoom without external libraries:
 
 2. **Selection Overlay Positioning**: `SelectionOverlay` calculates bounding boxes relative to scaled container. Must recalculate on viewport changes (`useEffect` deps: `[selectedId, scale, contentRef]`).
 
-3. **Export Timing**: Must wait for `finalRenderedSvg` render (200ms delay in loop) before capturing with `html-to-image`. Race conditions cause blank exports.
+3. **Export Timing**: Export rasterises each record from an off-screen node using `renderRecordSvg()` (in `utils/helpers.ts`), so it no longer depends on React re-render timing or fixed `setTimeout` delays. The live canvas still renders via `finalRenderedSvg` state for the preview.
 
-4. **LocalStorage Limits**: Projects stored as JSON strings. Large SVGs + many JSON rows can hit 5MB limit. No current mitigation.
+4. **Storage Limits**: Projects now persist in IndexedDB (`utils/db.ts`), which avoids the old ~5MB `localStorage` quota. Save failures surface a toast instead of failing silently.
 
 5. **QR Code ViewBox**: Generated QR SVG must preserve original element's `x/y/width/height` but use dynamic `viewBox`. Parse generated SVG to extract correct viewBox.
 
